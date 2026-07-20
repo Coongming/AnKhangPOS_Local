@@ -1,81 +1,271 @@
-import { NextResponse } from 'next/server';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import path from 'path';
-import os from 'os';
+import { execFile } from 'child_process';
 import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+import { NextResponse } from 'next/server';
 
-const execAsync = promisify(exec);
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
-export async function POST() {
-  const supabaseUrl = process.env.SUPABASE_DIRECT_URL;
-  if (!supabaseUrl) {
-    return NextResponse.json({ error: 'SUPABASE_DIRECT_URL chưa được cấu hình' }, { status: 500 });
-  }
+type CommandResult = {
+  stdout: string;
+  stderr: string;
+};
 
-  const tmpDir = os.tmpdir();
-  const dumpFile = path.join(tmpDir, 'sync_dump.sql');
-  const scriptFile = path.join(tmpDir, 'sync_script.sql');
+function isPostgresUrl(value: string | undefined): value is string {
+  if (!value) return false;
 
   try {
-    // Bước 1: Dump data (Chỉ chạy ở local nên cực nhanh)
-    const dumpCmd = `pg_dump -U ankhang -h localhost -d ankhangpos --data-only --no-owner --no-acl --disable-triggers --schema=public -f "${dumpFile}"`;
-    await execAsync(dumpCmd, { env: { ...process.env, PGPASSWORD: 'ankhang123' } });
+    const parsed = new URL(value);
+    return parsed.protocol === 'postgresql:' || parsed.protocol === 'postgres:';
+  } catch {
+    return false;
+  }
+}
 
-    // Bước 2: Lấy danh sách bảng cũng từ LOCAL (Không gọi sang Sing, không tốn thời gian)
-    // Lưu ý: Đòi hỏi Local DB và Supabase DB phải có cấu trúc bảng giống hệt nhau (ta đã xóa bảng thừa lúc nãy)
-    const { stdout: tablesOut } = await execAsync(
-      `psql -U ankhang -h localhost -d ankhangpos -t -A -c "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename;"`,
-      { env: { ...process.env, PGPASSWORD: 'ankhang123' } }
+function commandName(command: string): string {
+  if (process.platform === 'win32' && (command === 'pg_dump' || command === 'psql')) {
+    return `${command}.exe`;
+  }
+
+  return command;
+}
+
+function cleanProcessEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+
+  for (const [key, value] of Object.entries(process.env)) {
+    if (key && !key.startsWith('=') && value !== undefined) {
+      env[key] = value;
+    }
+  }
+
+  env.PGCONNECT_TIMEOUT = '20';
+  Object.assign(env, overrides);
+  return env;
+}
+
+function runCommand(
+  command: string,
+  args: string[],
+  envOverrides: NodeJS.ProcessEnv = {}
+): Promise<CommandResult> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      commandName(command),
+      args,
+      {
+        cwd: process.cwd(),
+        env: cleanProcessEnv(envOverrides),
+        encoding: 'utf8',
+        maxBuffer: 50 * 1024 * 1024,
+        timeout: 5 * 60 * 1000,
+      },
+      (error, stdout, stderr) => {
+        const result = {
+          stdout: stdout || '',
+          stderr: stderr || '',
+        };
+
+        if (error) {
+          const details = result.stderr.trim() || error.message;
+          reject(new Error(`${command} thất bại: ${details}`));
+          return;
+        }
+
+        resolve(result);
+      }
     );
-    const tables = tablesOut.trim().split(/\r?\n/).filter(Boolean);
+  });
+}
 
-    if (tables.length === 0) throw new Error('Không tìm thấy bảng nào');
+async function updateOnlineSchema(onlineDatabaseUrl: string): Promise<void> {
+  const prismaCli = path.join(process.cwd(), 'node_modules', 'prisma', 'build', 'index.js');
 
-    // Bước 3: GỘP TẤT CẢ LỆNH THÀNH 1 FILE DUY NHẤT ĐỂ TIẾT KIỆM KẾT NỐI
-    const truncateSQL = tables.map(t => `TRUNCATE TABLE public."${t}" CASCADE;`).join('\n');
-    const countQueries = tables.map(t => `SELECT '${t}' as t, count(*) as c FROM public."${t}"`).join(' UNION ALL ');
-    const dumpFilePath = dumpFile.replace(/\\/g, '/'); // Chuẩn hóa đường dẫn cho psql \i
-    
-    const combinedScript = `-- Xoa du lieu cu\n${truncateSQL}\n\n-- Khoi phuc du lieu\n\\set ON_ERROR_STOP off\n\\i '${dumpFilePath}'\n\\set ON_ERROR_STOP on\n\n-- Dem so luong\n${countQueries};`;
-    await fs.writeFile(scriptFile, combinedScript, 'utf-8');
+  await fs.access(prismaCli).catch(() => {
+    throw new Error('Không tìm thấy Prisma CLI. Hãy chạy npm install trên máy hiện tại');
+  });
 
-    // Bước 4: MỞ ĐÚNG 1 KẾT NỐI TỚI SUPABASE VÀ CHẠY HẾT SCRIPT (Siêu tốc)
-    let countOutput = '';
-    let warnings = 0;
-    try {
-      const { stdout, stderr } = await execAsync(
-        `psql "${supabaseUrl}" -t -A -f "${scriptFile}"`,
-        { maxBuffer: 10 * 1024 * 1024 }
-      );
-      countOutput = stdout;
-      warnings = stderr ? stderr.split('\n').filter(l => l.includes('ERROR') && !l.includes('schema') && !l.includes('auth.') && !l.includes('storage.')).length : 0;
-    } catch (e: any) {
-      countOutput = e.stdout || '';
+  await runCommand(
+    process.execPath,
+    [prismaCli, 'db', 'push', '--schema', 'prisma/schema.prisma', '--skip-generate'],
+    {
+      DATABASE_URL: onlineDatabaseUrl,
+      DIRECT_URL: onlineDatabaseUrl,
+    }
+  );
+}
+
+function quoteIdentifier(value: string): string {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function quoteLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function sanitizeError(message: string, urls: string[]): string {
+  return urls.reduce((result, url) => result.split(url).join('[DATABASE_URL]'), message);
+}
+
+async function getLocalTables(localDatabaseUrl: string): Promise<string[]> {
+  const { stdout } = await runCommand('psql', [
+    '-d',
+    localDatabaseUrl,
+    '-X',
+    '-t',
+    '-A',
+    '-c',
+    "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> '_prisma_migrations' ORDER BY tablename;",
+  ]);
+
+  return stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+export async function POST() {
+  const localDatabaseUrl = process.env.LOCAL_DATABASE_URL || process.env.DATABASE_URL;
+  const onlineDatabaseUrl = process.env.SUPABASE_DIRECT_URL;
+
+  if (!isPostgresUrl(localDatabaseUrl)) {
+    return NextResponse.json(
+      { error: 'LOCAL_DATABASE_URL hoặc DATABASE_URL local chưa được cấu hình đúng' },
+      { status: 500 }
+    );
+  }
+
+  if (!isPostgresUrl(onlineDatabaseUrl)) {
+    return NextResponse.json(
+      { error: 'SUPABASE_DIRECT_URL chưa được cấu hình đúng' },
+      { status: 500 }
+    );
+  }
+
+  let tempDir = '';
+
+  try {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ankhangpos-sync-'));
+    const dumpFile = path.join(tempDir, 'local-data.sql');
+    const restoreFile = path.join(tempDir, 'restore-online.sql');
+
+    await updateOnlineSchema(onlineDatabaseUrl);
+
+    const tables = await getLocalTables(localDatabaseUrl);
+
+    if (tables.length === 0) {
+      throw new Error('Không tìm thấy bảng dữ liệu nào trong database local');
     }
 
-    // Parse kết quả đếm dòng
-    const lines = countOutput.trim().split(/\r?\n/).filter(Boolean);
-    const synced = lines.filter(line => line.includes('|')).map(line => {
-      const [table, count] = line.split('|');
-      return { table: table.trim(), count: parseInt(count) };
-    }).filter(r => !isNaN(r.count) && r.count > 0);
+    await runCommand('pg_dump', [
+      '-d',
+      localDatabaseUrl,
+      '--data-only',
+      '--no-owner',
+      '--no-acl',
+      '--schema=public',
+      '--exclude-table=public._prisma_migrations',
+      '--file',
+      dumpFile,
+    ]);
 
-    const totalRows = synced.reduce((sum, r) => sum + r.count, 0);
+    const tableList = tables.map((table) => `public.${quoteIdentifier(table)}`).join(', ');
+    const countSql = tables
+      .map(
+        (table) =>
+          `SELECT 'SYNC_COUNT', ${quoteLiteral(table)}, count(*)::text FROM public.${quoteIdentifier(table)}`
+      )
+      .join(' UNION ALL ');
+    const dumpPathForPsql = dumpFile.replace(/\\/g, '/').replace(/'/g, "''");
+    const circularConstraints = [
+      {
+        table: 'products',
+        constraint: 'products_blend_template_id_fkey',
+      },
+      {
+        table: 'blend_templates',
+        constraint: 'blend_templates_output_product_id_fkey',
+      },
+    ];
+    const deferCircularConstraints = circularConstraints
+      .map(
+        ({ table, constraint }) =>
+          `ALTER TABLE public.${quoteIdentifier(table)} ALTER CONSTRAINT ${quoteIdentifier(constraint)} DEFERRABLE INITIALLY IMMEDIATE;`
+      )
+      .join('\n');
+    const restoreCircularConstraints = circularConstraints
+      .map(
+        ({ table, constraint }) =>
+          `ALTER TABLE public.${quoteIdentifier(table)} ALTER CONSTRAINT ${quoteIdentifier(constraint)} NOT DEFERRABLE;`
+      )
+      .join('\n');
 
-    // Cleanup rác
-    await Promise.all([ fs.unlink(dumpFile).catch(() => {}), fs.unlink(scriptFile).catch(() => {}) ]);
+    const restoreSql = [
+      '\\set ON_ERROR_STOP on',
+      'BEGIN;',
+      deferCircularConstraints,
+      'SET CONSTRAINTS ALL DEFERRED;',
+      `TRUNCATE TABLE ${tableList} CASCADE;`,
+      `\\i '${dumpPathForPsql}'`,
+      'SET CONSTRAINTS ALL IMMEDIATE;',
+      restoreCircularConstraints,
+      'COMMIT;',
+      `${countSql};`,
+    ].join('\n');
 
-    return NextResponse.json({ 
-      success: true, 
-      message: `Đồng bộ thành công ${totalRows} dòng dữ liệu lên Supabase`, 
-      tables: synced, 
-      totalRows, 
-      warnings 
+    await fs.writeFile(restoreFile, restoreSql, 'utf8');
+
+    const { stdout, stderr } = await runCommand('psql', [
+      '-d',
+      onlineDatabaseUrl,
+      '-X',
+      '-t',
+      '-A',
+      '-F',
+      '|',
+      '-f',
+      restoreFile,
+    ]);
+
+    const synced = stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('SYNC_COUNT|'))
+      .map((line) => {
+        const [, table, count] = line.split('|');
+        return { table, count: Number.parseInt(count, 10) };
+      })
+      .filter((row) => row.table && Number.isFinite(row.count));
+
+    if (synced.length !== tables.length) {
+      throw new Error('Đã ghi dữ liệu nhưng không kiểm tra được đầy đủ số dòng trên Supabase');
+    }
+
+    const totalRows = synced.reduce((sum, row) => sum + row.count, 0);
+    const warnings = stderr
+      .split(/\r?\n/)
+      .filter((line) => /warning/i.test(line))
+      .length;
+
+    return NextResponse.json({
+      success: true,
+      message: `Đã cập nhật cấu trúc và đồng bộ thành công ${totalRows} dòng dữ liệu lên Supabase`,
+      tables: synced,
+      totalRows,
+      warnings,
     });
   } catch (error) {
-    await Promise.all([ fs.unlink(dumpFile).catch(() => {}), fs.unlink(scriptFile).catch(() => {}) ]);
-    const msg = error instanceof Error ? error.message : 'Lỗi không xác định';
-    return NextResponse.json({ error: `Đồng bộ thất bại: ${msg}` }, { status: 500 });
+    const rawMessage = error instanceof Error ? error.message : 'Lỗi không xác định';
+    const message = sanitizeError(rawMessage, [localDatabaseUrl, onlineDatabaseUrl]);
+
+    return NextResponse.json(
+      { error: `Đồng bộ thất bại: ${message}` },
+      { status: 500 }
+    );
+  } finally {
+    if (tempDir) {
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 }

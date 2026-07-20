@@ -20,6 +20,10 @@ export async function GET(request: NextRequest) {
       endDate = getEndOfDayVN(new Date(dateTo + 'T00:00:00+07:00'));
     } else {
       switch (period) {
+        case 'all':
+          startDate = new Date('2000-01-01T00:00:00Z');
+          endDate = getEndOfDayVN();
+          break;
         case 'day':
           startDate = getStartOfDayVN();
           endDate = getEndOfDayVN();
@@ -54,20 +58,22 @@ export async function GET(request: NextRequest) {
       const totalRevenue = sales.reduce((sum, s) => sum + s.totalAmount, 0);
       const totalCost = sales.reduce((sum, s) => sum + s.totalCost, 0);
       const totalOrders = sales.length;
-      const cashRevenue = sales.filter(s => s.paymentMethod === 'cash').reduce((sum, s) => sum + s.totalAmount, 0);
-      const transferRevenue = sales.filter(s => s.paymentMethod === 'transfer').reduce((sum, s) => sum + s.totalAmount, 0);
+      const cashRevenue = sales.filter(s => s.paymentMethod === 'cash').reduce((sum, s) => sum + s.paidAmount, 0);
+      const transferRevenue = sales.filter(s => s.paymentMethod === 'transfer').reduce((sum, s) => sum + s.paidAmount, 0);
+      const debtRevenue = sales.reduce((sum, s) => sum + s.debtAmount, 0);
 
       // Group by date
-      const dailyData: Record<string, { date: string; revenue: number; orders: number; cashRevenue: number; transferRevenue: number }> = {};
+      const dailyData: Record<string, { date: string; revenue: number; orders: number; cashRevenue: number; transferRevenue: number; debtRevenue: number }> = {};
       sales.forEach((s) => {
         // Convert to VN timezone for correct date grouping
         const vnDate = new Date(s.saleDate.getTime() + 7 * 60 * 60 * 1000);
         const dateKey = vnDate.toISOString().split('T')[0];
-        if (!dailyData[dateKey]) dailyData[dateKey] = { date: dateKey, revenue: 0, orders: 0, cashRevenue: 0, transferRevenue: 0 };
+        if (!dailyData[dateKey]) dailyData[dateKey] = { date: dateKey, revenue: 0, orders: 0, cashRevenue: 0, transferRevenue: 0, debtRevenue: 0 };
         dailyData[dateKey].revenue += s.totalAmount;
         dailyData[dateKey].orders += 1;
-        if (s.paymentMethod === 'cash') dailyData[dateKey].cashRevenue += s.totalAmount;
-        else if (s.paymentMethod === 'transfer') dailyData[dateKey].transferRevenue += s.totalAmount;
+        dailyData[dateKey].debtRevenue += s.debtAmount;
+        if (s.paymentMethod === 'cash') dailyData[dateKey].cashRevenue += s.paidAmount;
+        else if (s.paymentMethod === 'transfer') dailyData[dateKey].transferRevenue += s.paidAmount;
       });
 
       return NextResponse.json({
@@ -77,6 +83,7 @@ export async function GET(request: NextRequest) {
         grossProfit: totalRevenue - totalCost,
         cashRevenue,
         transferRevenue,
+        debtRevenue,
         dailyData: Object.values(dailyData),
       });
     }
