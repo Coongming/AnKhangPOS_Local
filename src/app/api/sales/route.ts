@@ -61,7 +61,7 @@ export async function POST(request: NextRequest) {
       orderBy: { code: 'desc' },
       select: { code: true },
     });
-    const code = generateCode('HD', lastSale?.code || null);
+    const code = generateCode('HD', lastSale?.code || null, 5);
 
     // Check system setting for negative stock
     const allowNegStock = await prisma.systemSetting.findUnique({
