@@ -31,8 +31,10 @@ function commandName(command: string): string {
   return command;
 }
 
-function cleanProcessEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {};
+function cleanProcessEnv(overrides: Partial<NodeJS.ProcessEnv> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    NODE_ENV: process.env.NODE_ENV,
+  };
 
   for (const [key, value] of Object.entries(process.env)) {
     if (key && !key.startsWith('=') && value !== undefined) {
