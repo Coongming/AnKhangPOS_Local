@@ -50,7 +50,7 @@ function cleanProcessEnv(overrides: Partial<NodeJS.ProcessEnv> = {}): NodeJS.Pro
 function runCommand(
   command: string,
   args: string[],
-  envOverrides: NodeJS.ProcessEnv = {}
+  envOverrides: Partial<NodeJS.ProcessEnv> = {}
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
     execFile(
